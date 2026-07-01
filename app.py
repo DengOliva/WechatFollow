@@ -552,34 +552,22 @@ def submission_url(task: sqlite3.Row, request_base_url: str) -> str:
 
 def notification_message(task: sqlite3.Row, link: str) -> str:
     return (
-        "+---------- 待办任务 ----------+\n"
-        f"| 责任人：{task['assignee']}\n"
-        f"| 期限：{task['deadline']}\n"
-        "+---------- 任务内容 ----------+\n"
-        f"{task['content']}\n"
-        "+---------- 提交入口 ----------+\n"
-        f"{link}\n"
-        "+------------------------------+\n"
-        "请在期限前打开链接上传资料。"
+        "任务通知\n"
+        f"责任人：{task['assignee']}\n"
+        f"任务内容：{task['content']}\n"
+        f"完成期限：{task['deadline']}\n"
+        f"提交入口：{link}"
     )
 
 
 def reminder_message(task: sqlite3.Row, link: str, urgent: bool) -> str:
-    title = "【临期/逾期任务提醒】" if urgent else "【任务提醒】"
-    intro = (
-        "这项任务已临近或超过期限，请尽快处理："
-        if urgent
-        else "你有一项任务尚未提交资料："
-    )
+    title = "临期/逾期任务提醒" if urgent else "任务提醒"
     return (
-        f"+---------- {title.strip('【】')} ----------+\n"
-        f"| {intro}\n"
-        f"| 期限：{task['deadline']}\n"
-        "+---------- 任务内容 ----------+\n"
-        f"{task['content']}\n"
-        "+---------- 提交入口 ----------+\n"
-        f"{link}\n"
-        "+------------------------------+"
+        f"{title}\n"
+        f"责任人：{task['assignee']}\n"
+        f"任务内容：{task['content']}\n"
+        f"完成期限：{task['deadline']}\n"
+        f"提交入口：{link}"
     )
 
 
