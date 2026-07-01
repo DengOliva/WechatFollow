@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import base64
 import html
-import hmac
 import json
 import mimetypes
 import os
@@ -31,8 +29,6 @@ HOST = "127.0.0.1"
 PORT = int(os.environ.get("APP_PORT", "8000"))
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
-ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 NORMAL_REMINDER_SLOTS = ("08:30",)
 URGENT_REMINDER_SLOTS = ("08:30", "14:30")
 DEFAULT_ADMIN_RECIPIENT = "邓宇聪"
@@ -1222,37 +1218,6 @@ def task_detail_page(task: sqlite3.Row) -> bytes:
 
 
 class Handler(BaseHTTPRequestHandler):
-    def is_public_submission_path(self, path: str) -> bool:
-        parts = path.strip("/").split("/")
-        return len(parts) >= 2 and parts[0] == "submit"
-
-    def is_authorized(self) -> bool:
-        if not ADMIN_PASSWORD:
-            return True
-        header = self.headers.get("Authorization", "")
-        if not header.startswith("Basic "):
-            return False
-        try:
-            decoded = base64.b64decode(header[6:], validate=True).decode("utf-8")
-            username, password = decoded.split(":", 1)
-        except (ValueError, UnicodeDecodeError):
-            return False
-        return hmac.compare_digest(username, ADMIN_USERNAME) and hmac.compare_digest(
-            password, ADMIN_PASSWORD
-        )
-
-    def require_admin(self, path: str) -> bool:
-        if self.is_public_submission_path(path) or self.is_authorized():
-            return False
-        body = "Administrator credentials are required.".encode("utf-8")
-        self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="WechatFollow Admin"')
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-        return True
-
     def send_html(self, content: bytes, status: int = 200) -> None:
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1350,8 +1315,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
-        if self.require_admin(parsed.path):
-            return
         if parsed.path == "/":
             query = urllib.parse.parse_qs(parsed.query)
             self.send_html(
@@ -1447,8 +1410,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
-        if self.require_admin(parsed.path):
-            return
         parts = parsed.path.strip("/").split("/")
         if len(parts) == 2 and parts[0] == "submit":
             task = get_task_by_token(parts[1])
@@ -1572,10 +1533,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    if PUBLIC_BASE_URL.startswith("https://") and not ADMIN_PASSWORD:
-        raise RuntimeError(
-            "ADMIN_PASSWORD must be configured before using a public HTTPS URL."
-        )
     initialize_database()
     reminder_thread = threading.Thread(
         target=reminder_loop,
