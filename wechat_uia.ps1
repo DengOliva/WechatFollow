@@ -31,8 +31,22 @@ public static class NativeWindow {
     public static extern bool SetCursorPos(int X, int Y);
     [DllImport("user32.dll")]
     public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
+    [DllImport("user32.dll")]
+    public static extern int GetSystemMetrics(int index);
+    [DllImport("user32.dll")]
+    public static extern uint GetDpiForWindow(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
 }
 "@
+
+# UI Automation rectangles and mouse coordinates must use the same physical
+# coordinate system on desktops with 125%/150% scaling.
+try {
+    [NativeWindow]::SetProcessDpiAwarenessContext([IntPtr](-4)) | Out-Null
+} catch {
+    # Older Windows versions may not expose per-monitor-v2 DPI awareness.
+}
 
 function Fail([string]$Text) {
     [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -61,6 +75,25 @@ function Click-Point([int]$X, [int]$Y) {
     Start-Sleep -Milliseconds 100
     [NativeWindow]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
     [NativeWindow]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+}
+
+function Write-EnvironmentLog($Handle, $Rect) {
+    try {
+        $dpi = [NativeWindow]::GetDpiForWindow($Handle)
+        if ($dpi -le 0) { $dpi = 96 }
+        $screenWidth = [NativeWindow]::GetSystemMetrics(0)
+        $screenHeight = [NativeWindow]::GetSystemMetrics(1)
+        $windowWidth = $Rect.Right - $Rect.Left
+        $windowHeight = $Rect.Bottom - $Rect.Top
+        $line = (
+            "{0:o}`tscreen={1}x{2}`tdpi={3}`tscale={4:N2}`twindow={5}x{6}" -f
+            [DateTime]::Now, $screenWidth, $screenHeight, $dpi,
+            ($dpi / 96.0), $windowWidth, $windowHeight
+        )
+        Add-Content -LiteralPath "$PSScriptRoot\uia-environment.log" -Value $line -Encoding utf8
+    } catch {
+        # Diagnostics must never prevent a notification.
+    }
 }
 
 $processes = @(
@@ -114,10 +147,16 @@ $handle = [IntPtr]$window.Current.NativeWindowHandle
 if ($handle -eq [IntPtr]::Zero) {
     Fail "WECHAT_WINDOW_NOT_FOUND"
 }
-[NativeWindow]::ShowWindow($handle, 9) | Out-Null
+# Maximize WeChat so narrow RDP resolutions expose the largest possible editor.
+[NativeWindow]::ShowWindow($handle, 3) | Out-Null
 [NativeWindow]::SetForegroundWindow($handle) | Out-Null
 Try-FocusElement $window | Out-Null
-Start-Sleep -Milliseconds 400
+Start-Sleep -Milliseconds 600
+
+$initialRect = New-Object NativeWindow+RECT
+if ([NativeWindow]::GetWindowRect($handle, [ref]$initialRect)) {
+    Write-EnvironmentLog $handle $initialRect
+}
 
 $editCondition = New-Object System.Windows.Automation.PropertyCondition(
     [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
@@ -190,9 +229,25 @@ if (-not $messageFocused) {
     # Click relative to the bottom edge, not a percentage from the top.
     # When the editor is collapsed, a height-based percentage can land on
     # the emoji/file toolbar instead of the text area.
+    $dpi = [NativeWindow]::GetDpiForWindow($foreground)
+    if ($dpi -le 0) { $dpi = 96 }
+    $scale = $dpi / 96.0
     $inputX = [int]($rect.Left + ($width * 0.68))
-    $bottomInset = [Math]::Max(45, [Math]::Min(70, [int]($height * 0.07)))
+    $minimumInset = [int](45 * $scale)
+    $maximumInset = [int](78 * $scale)
+    $bottomInset = [Math]::Max(
+        $minimumInset,
+        [Math]::Min($maximumInset, [int]($height * 0.08))
+    )
     $inputY = $rect.Bottom - $bottomInset
+
+    # Keep the fallback click inside the current virtual desktop, including RDP.
+    $virtualLeft = [NativeWindow]::GetSystemMetrics(76)
+    $virtualTop = [NativeWindow]::GetSystemMetrics(77)
+    $virtualRight = $virtualLeft + [NativeWindow]::GetSystemMetrics(78) - 1
+    $virtualBottom = $virtualTop + [NativeWindow]::GetSystemMetrics(79) - 1
+    $inputX = [Math]::Max($virtualLeft, [Math]::Min($virtualRight, $inputX))
+    $inputY = [Math]::Max($virtualTop, [Math]::Min($virtualBottom, $inputY))
     Click-Point $inputX $inputY
 }
 
