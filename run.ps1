@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 $bundledPython = "C:\Users\Yucon\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
 
 if (-not $env:PUBLIC_BASE_URL) {
-    $env:PUBLIC_BASE_URL = "http://127.0.0.1:8000"
+    $env:PUBLIC_BASE_URL = "https://center.gxajb.site"
 }
 
 if (Test-Path "$PSScriptRoot\.venv\Scripts\python.exe") {
