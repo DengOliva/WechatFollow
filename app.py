@@ -588,11 +588,10 @@ def admin_submission_message(
 ) -> str:
     note = submission["note"].strip() or "未填写"
     return (
-        "+---------- 任务完成反馈 ----------+\n"
+        "任务完成反馈\n"
         f"任务内容：{task['content']}\n"
         f"提交说明：{note}\n"
-        f"任务完成资料：{submission['original_filename']}\n"
-        "+----------------------------------+"
+        f"任务完成资料：{submission['original_filename']}"
     )
 
 
