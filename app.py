@@ -5,8 +5,10 @@ import json
 import mimetypes
 import os
 import secrets
+import shutil
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -494,7 +496,9 @@ def parse_task_excel(file_data: bytes) -> tuple[list[tuple[str, str, str]], list
     return tasks, errors
 
 
-def send_wechat_message(recipient: str, message: str) -> tuple[bool, str]:
+def send_wechat_message(
+    recipient: str, message: str, attachment_path: Path | None = None
+) -> tuple[bool, str]:
     command = [
         "powershell.exe",
         "-NoProfile",
@@ -508,6 +512,8 @@ def send_wechat_message(recipient: str, message: str) -> tuple[bool, str]:
         "-Message",
         message,
     ]
+    if attachment_path is not None:
+        command.extend(["-AttachmentPath", str(attachment_path)])
     with WECHAT_LOCK:
         try:
             result = subprocess.run(
@@ -517,7 +523,7 @@ def send_wechat_message(recipient: str, message: str) -> tuple[bool, str]:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=30,
+                timeout=90 if attachment_path is not None else 30,
             )
         except subprocess.TimeoutExpired:
             return False, "操作超时，请确认微信窗口可见且没有被其他弹窗遮挡。"
@@ -529,7 +535,9 @@ def send_wechat_message(recipient: str, message: str) -> tuple[bool, str]:
         "WECHAT_NOT_RUNNING": "未检测到微信进程，请先启动并登录微信桌面端。",
         "WECHAT_WINDOW_NOT_FOUND": "微信正在运行，但找不到主窗口。请从系统托盘打开微信主界面后重试。",
         "CHAT_INPUT_NOT_FOUND": "已打开联系人，但无法定位聊天输入框。请保持微信主窗口完整显示后重试。",
+        "ATTACHMENT_NOT_FOUND": "文字已发送，但服务器上的任务完成资料不存在。",
         "SENT": f"已向 {recipient} 发送任务通知。",
+        "SENT_WITH_ATTACHMENT": f"已向 {recipient} 发送反馈和任务完成资料。",
     }
     output = messages.get(output, output)
     if result.returncode == 0:
@@ -576,22 +584,37 @@ def reminder_message(task: sqlite3.Row, link: str, urgent: bool) -> str:
 
 
 def admin_submission_message(
-    task: sqlite3.Row, submission: sqlite3.Row, detail_link: str
+    task: sqlite3.Row, submission: sqlite3.Row
 ) -> str:
     note = submission["note"].strip() or "未填写"
     return (
-        "+---------- 资料已提交 ----------+\n"
-        f"| 责任人：{task['assignee']}\n"
-        f"| 时间：{submission['submitted_at'].replace('T', ' ')}\n"
-        f"| 文件：{submission['original_filename']}\n"
-        "+---------- 任务内容 ------------+\n"
-        f"{task['content']}\n"
-        "+---------- 提交说明 ------------+\n"
-        f"{note}\n"
-        "+---------- 后台查看 ------------+\n"
-        f"{detail_link}\n"
-        "+--------------------------------+"
+        "+---------- 任务完成反馈 ----------+\n"
+        f"任务内容：{task['content']}\n"
+        f"提交说明：{note}\n"
+        f"任务完成资料：{submission['original_filename']}\n"
+        "+----------------------------------+"
     )
+
+
+def send_admin_submission(
+    admin_recipient: str, task: sqlite3.Row, submission: sqlite3.Row
+) -> tuple[bool, str]:
+    stored_path = UPLOAD_DIR / submission["stored_filename"]
+    if not stored_path.is_file():
+        return False, "服务器上的任务完成资料不存在。"
+
+    original_name = Path(submission["original_filename"]).name or "任务完成资料"
+    invalid_chars = '<>:"/\\|?*'
+    safe_name = "".join("_" if char in invalid_chars else char for char in original_name)
+    safe_name = safe_name.rstrip(" .") or "任务完成资料"
+    with tempfile.TemporaryDirectory(prefix="wechat-follow-submit-") as temp_dir:
+        outgoing_path = Path(temp_dir) / safe_name
+        shutil.copy2(stored_path, outgoing_path)
+        return send_wechat_message(
+            admin_recipient,
+            admin_submission_message(task, submission),
+            outgoing_path,
+        )
 
 
 def run_reminder_slot(reminder_slot: str) -> None:
@@ -1424,9 +1447,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             admin_recipient = get_admin_recipient()
             if admin_recipient:
-                detail_link = f"{PUBLIC_BASE_URL or self.request_base_url()}/tasks/{task['id']}"
-                admin_message = admin_submission_message(task, submission, detail_link)
-                ok, detail = send_wechat_message(admin_recipient, admin_message)
+                ok, detail = send_admin_submission(admin_recipient, task, submission)
                 print(
                     f"[ADMIN_NOTIFY] task={task['id']} admin={admin_recipient} "
                     f"success={ok} detail={detail}"

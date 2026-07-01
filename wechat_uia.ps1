@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Recipient,
-    [Parameter(Mandatory = $true)][string]$Message
+    [Parameter(Mandatory = $true)][string]$Message,
+    [string]$AttachmentPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -257,5 +258,24 @@ Paste-Text $Message
 Start-Sleep -Milliseconds 200
 [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
 
+if ($AttachmentPath) {
+    if (-not (Test-Path -LiteralPath $AttachmentPath -PathType Leaf)) {
+        Fail "ATTACHMENT_NOT_FOUND"
+    }
+    $resolvedAttachment = (Resolve-Path -LiteralPath $AttachmentPath).Path
+    $files = New-Object System.Collections.Specialized.StringCollection
+    [void]$files.Add($resolvedAttachment)
+    [System.Windows.Forms.Clipboard]::SetFileDropList($files)
+    Start-Sleep -Milliseconds 200
+    [System.Windows.Forms.SendKeys]::SendWait("^v")
+    Start-Sleep -Milliseconds 1500
+    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+    Start-Sleep -Milliseconds 500
+}
+
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-Write-Output "SENT"
+if ($AttachmentPath) {
+    Write-Output "SENT_WITH_ATTACHMENT"
+} else {
+    Write-Output "SENT"
+}
