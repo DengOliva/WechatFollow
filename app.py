@@ -364,6 +364,27 @@ def delete_task(task_id: int) -> bool:
     return deleted
 
 
+def delete_all_tasks() -> int:
+    with db() as connection:
+        submissions = connection.execute(
+            "SELECT stored_filename FROM submissions"
+        ).fetchall()
+        task_count = connection.execute("SELECT COUNT(*) AS count FROM tasks").fetchone()[
+            "count"
+        ]
+        connection.execute("DELETE FROM reminder_logs")
+        connection.execute("DELETE FROM submissions")
+        connection.execute("DELETE FROM tasks")
+    for submission in submissions:
+        file_path = UPLOAD_DIR / submission["stored_filename"]
+        try:
+            if file_path.is_file():
+                file_path.unlink()
+        except OSError as exc:
+            print(f"[DELETE_ALL] 删除上传文件失败：{file_path} {exc}")
+    return int(task_count)
+
+
 def create_task(content: str, deadline: str, assignee: str) -> int:
     with db() as connection:
         cursor = connection.execute(
@@ -1029,24 +1050,35 @@ def premium_styles() -> str:
     .steps { display:flex; align-items:center; gap:8px; margin:2px 0 18px; }
     .step { flex:1; height:4px; background:#dce7e1; border-radius:999px; }
     .step.active { background:var(--green); }
-    .workspace-grid { display:grid; grid-template-columns:minmax(0,1.45fr) minmax(310px,.75fr);
-      gap:18px; align-items:start; margin:20px 0 26px; }
+    .content-section { margin:24px 0; }
+    .section-title-row { display:flex; align-items:end; justify-content:space-between;
+      gap:16px; margin-bottom:12px; }
+    .section-title-row h2 { margin:0; }
+    .entry-grid { display:grid; grid-template-columns:minmax(0,1.45fr) minmax(300px,.55fr);
+      gap:18px; align-items:stretch; }
+    .settings-grid { display:grid; grid-template-columns:minmax(0,1.35fr) minmax(300px,.65fr);
+      gap:18px; align-items:start; }
     .toolbar { display:flex; justify-content:space-between; align-items:center; gap:14px;
       background:rgba(255,255,255,.86); border:1px solid var(--line);
       border-radius:16px; padding:12px; margin-bottom:18px; }
+    .toolbar-actions { display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
+    .toolbar-actions form { margin:0; }
     .tabs { display:flex; gap:8px; flex-wrap:wrap; }
     .tab { display:inline-flex; align-items:center; padding:10px 14px; border-radius:11px;
       color:#476056; text-decoration:none; font-weight:700; background:#f3f7f5; }
     .tab.active { color:white; background:linear-gradient(135deg,#08bd63,#07944f);
       box-shadow:0 5px 13px rgba(7,153,79,.15); }
-    .side-stack { display:grid; gap:16px; }
-    .workspace-grid .card { margin:0; }
+    .entry-grid .card,.settings-grid .card { margin:0; }
     .compact-card { padding:21px; }
     .compact-card .section-head { display:block; margin-bottom:14px; }
     .compact-card .section-note { margin-top:5px; line-height:1.6; }
     .toggle-row { display:flex; align-items:center; gap:10px; padding:9px 0;
       font-weight:700; }
     .toggle-row input { width:18px; height:18px; margin:0; }
+    .reminder-form-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .reminder-form-grid .wide { grid-column:1 / -1; }
+    .danger-zone { border-color:#f0d3d0; background:#fffafa; }
+    button:disabled { opacity:.45; cursor:not-allowed; transform:none; }
     .create-card { min-height:100%; }
     .create-card .grid { grid-template-columns:1fr 1fr; }
     .create-card .grid label:first-child { grid-column:1 / -1; }
@@ -1062,9 +1094,12 @@ def premium_styles() -> str:
       .stats { grid-template-columns:1fr 1fr; }
       .stat:first-child { grid-column:1 / -1; }
       .submit-hero { border-radius:18px; padding:27px 22px; }
-      .workspace-grid { grid-template-columns:1fr; }
+      .entry-grid,.settings-grid { grid-template-columns:1fr; }
       .toolbar { display:grid; grid-template-columns:1fr; }
-      .toolbar form button { width:100%; }
+      .toolbar-actions { display:grid; grid-template-columns:1fr 1fr; }
+      .toolbar-actions form,.toolbar-actions button { width:100%; }
+      .reminder-form-grid { grid-template-columns:1fr; }
+      .reminder-form-grid .wide { grid-column:auto; }
       .create-card .grid { grid-template-columns:1fr; }
       .create-card .grid label:first-child { grid-column:auto; }
       .entry-actions { display:grid; grid-template-columns:1fr; }
@@ -1225,13 +1260,24 @@ def page(
       <a class="tab {'active' if view == 'pending' else ''}" href="/?view=pending">待处理 {pending_count}</a>
       <a class="tab {'active' if view == 'done' else ''}" href="/?view=done">已完成 {submitted_count}</a>
     </div>
-    <form method="post" action="/tasks/remind-all"
-      onsubmit="return confirm('确定提醒当前所有待处理任务的责任人吗？')">
-      <button type="submit">一键提醒待处理任务</button>
-    </form>
+    <div class="toolbar-actions">
+      <form method="post" action="/tasks/remind-all"
+        onsubmit="return confirm('确定提醒当前所有待处理任务吗？')">
+        <button type="submit" {'disabled' if pending_count == 0 else ''}>一键提醒</button>
+      </form>
+      <form method="post" action="/tasks/delete-all"
+        onsubmit="return confirm('确定清除全部任务吗？这会永久删除所有任务、提交记录和上传资料，且无法恢复。')">
+        <button class="danger" type="submit" {'disabled' if total_count == 0 else ''}>一键清除任务</button>
+      </form>
+    </div>
   </section>
   {notice}
-  <section class="workspace-grid">
+  <section class="content-section">
+    <div class="section-title-row">
+      <h2>任务录入</h2>
+      <div class="section-note">支持单条创建和 Excel 批量导入</div>
+    </div>
+    <div class="entry-grid">
     <div class="card create-card">
       <div class="section-head">
         <h2>创建新任务</h2>
@@ -1250,26 +1296,46 @@ def page(
         <button type="submit">添加任务</button>
       </form>
     </div>
-    <div class="side-stack">
+      <section class="card compact-card">
+        <div class="section-head">
+          <h2>Excel 批量导入</h2>
+          <div class="section-note">每一行导入为一个任务，适合集中建档。</div>
+        </div>
+        <form method="post" action="/tasks/import" enctype="multipart/form-data" class="import-grid">
+          <label>选择 Excel 文件
+            <input name="file" type="file" accept=".xlsx,.xlsm" required>
+          </label>
+          <button type="submit">导入</button>
+        </form>
+        <p class="import-tip">表头：任务内容及要求、责任人、完成期限。</p>
+      </section>
+    </div>
+  </section>
+  <section class="content-section">
+    <div class="section-title-row">
+      <h2>系统设置</h2>
+      <div class="section-note">提醒方式、时间和管理员通知</div>
+    </div>
+    <div class="settings-grid">
       <section class="card compact-card">
         <div class="section-head">
           <h2>提醒设置</h2>
           <div class="section-note">控制群聊、私聊渠道和每日提醒时间。</div>
         </div>
-        <form method="post" action="/settings/reminders" class="import-grid">
+        <form method="post" action="/settings/reminders" class="reminder-form-grid">
           <label class="toggle-row">
             <input type="checkbox" name="group_enabled" value="1"
               {'checked' if group_enabled else ''}>
             开启群消息提醒
           </label>
-          <label>提醒群名称
-            <input name="group_recipient" maxlength="100"
-              value="{html.escape(reminder_group, quote=True)}">
-          </label>
           <label class="toggle-row">
             <input type="checkbox" name="private_enabled" value="1"
               {'checked' if private_enabled else ''}>
             开启责任人私聊提醒
+          </label>
+          <label class="wide">提醒群名称
+            <input name="group_recipient" maxlength="100"
+              value="{html.escape(reminder_group, quote=True)}">
           </label>
           <label>常规任务提醒时间
             <input name="normal_slots" required
@@ -1281,37 +1347,24 @@ def page(
               value="{html.escape(','.join(urgent_slots), quote=True)}"
               placeholder="08:30,14:30">
           </label>
-          <button type="submit">保存提醒设置</button>
+          <button class="wide" type="submit">保存提醒设置</button>
         </form>
         <p class="import-tip">多个时间用英文逗号分隔，例如 08:30,14:30。</p>
       </section>
       <section class="card compact-card">
         <div class="section-head">
           <h2>管理员通知</h2>
-          <div class="section-note">责任人提交资料后，自动通知此微信联系人。</div>
+          <div class="section-note">责任人提交资料后，自动发送反馈和资料文件。</div>
         </div>
         <form method="post" action="/settings/admin" class="import-grid">
-          <label>管理员微信昵称或备注名
+          <label>管理员微信备注名
             <input name="admin_recipient" required maxlength="100"
               value="{html.escape(admin_recipient, quote=True)}"
               placeholder="例如：邓宇聪">
           </label>
-          <button type="submit">保存</button>
+          <button type="submit">保存管理员</button>
         </form>
-        <p class="import-tip">需能被机器人小号准确搜索到。</p>
-      </section>
-      <section class="card compact-card">
-        <div class="section-head">
-          <h2>Excel 批量导入</h2>
-          <div class="section-note">每一行导入为一个任务。</div>
-        </div>
-        <form method="post" action="/tasks/import" enctype="multipart/form-data" class="import-grid">
-          <label>选择 Excel 文件
-            <input name="file" type="file" accept=".xlsx,.xlsm" required>
-          </label>
-          <button type="submit">导入</button>
-        </form>
-        <p class="import-tip">表头：任务内容及要求、责任人、完成期限。</p>
+        <p class="import-tip">请使用机器人小号中的唯一联系人备注。</p>
       </section>
     </div>
   </section>
@@ -1773,6 +1826,11 @@ class Handler(BaseHTTPRequestHandler):
             if failed:
                 message += " " + "；".join(failed[:3])
             self.redirect(message, bool(failed))
+            return
+
+        if parsed.path == "/tasks/delete-all":
+            deleted_count = delete_all_tasks()
+            self.redirect(f"已清除 {deleted_count} 个任务及其提交资料。")
             return
 
         if parsed.path == "/tasks":
