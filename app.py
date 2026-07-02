@@ -31,9 +31,10 @@ HOST = "127.0.0.1"
 PORT = int(os.environ.get("APP_PORT", "8000"))
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
-NORMAL_REMINDER_SLOTS = ("08:30",)
-URGENT_REMINDER_SLOTS = ("08:30", "14:30")
+DEFAULT_NORMAL_REMINDER_SLOTS = ("08:30",)
+DEFAULT_URGENT_REMINDER_SLOTS = ("08:30", "14:30")
 DEFAULT_ADMIN_RECIPIENT = "邓宇聪"
+DEFAULT_REMINDER_GROUP = "中心-各项目体系负责人群"
 WECHAT_LOCK = threading.Lock()
 
 
@@ -77,6 +78,17 @@ def initialize_database() -> None:
         connection.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
             ("admin_recipient", DEFAULT_ADMIN_RECIPIENT),
+        )
+        reminder_defaults = {
+            "group_reminder_enabled": "1",
+            "private_reminder_enabled": "0",
+            "reminder_group_recipient": DEFAULT_REMINDER_GROUP,
+            "normal_reminder_slots": ",".join(DEFAULT_NORMAL_REMINDER_SLOTS),
+            "urgent_reminder_slots": ",".join(DEFAULT_URGENT_REMINDER_SLOTS),
+        }
+        connection.executemany(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+            reminder_defaults.items(),
         )
         connection.execute(
             """
@@ -239,6 +251,83 @@ def set_admin_recipient(value: str) -> None:
     set_setting("admin_recipient", value.strip() or DEFAULT_ADMIN_RECIPIENT)
 
 
+def parse_reminder_slots(value: str) -> tuple[str, ...]:
+    raw_slots = value.replace("，", ",").split(",")
+    slots: list[str] = []
+    for raw_slot in raw_slots:
+        slot = raw_slot.strip()
+        if not slot:
+            continue
+        try:
+            normalized = datetime.strptime(slot, "%H:%M").strftime("%H:%M")
+        except ValueError as exc:
+            raise ValueError(f"提醒时间格式不正确：{slot}，请使用 HH:MM。") from exc
+        if normalized not in slots:
+            slots.append(normalized)
+    if not slots:
+        raise ValueError("至少需要设置一个提醒时间。")
+    return tuple(sorted(slots))
+
+
+def get_reminder_slots() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    normal_value = get_setting(
+        "normal_reminder_slots", ",".join(DEFAULT_NORMAL_REMINDER_SLOTS)
+    )
+    urgent_value = get_setting(
+        "urgent_reminder_slots", ",".join(DEFAULT_URGENT_REMINDER_SLOTS)
+    )
+    try:
+        normal_slots = parse_reminder_slots(normal_value)
+    except ValueError:
+        normal_slots = DEFAULT_NORMAL_REMINDER_SLOTS
+    try:
+        urgent_slots = parse_reminder_slots(urgent_value)
+    except ValueError:
+        urgent_slots = DEFAULT_URGENT_REMINDER_SLOTS
+    return normal_slots, urgent_slots
+
+
+def get_reminder_channels(task: sqlite3.Row) -> list[tuple[str, str]]:
+    channels: list[tuple[str, str]] = []
+    if get_setting("group_reminder_enabled", "1") == "1":
+        group_recipient = get_setting(
+            "reminder_group_recipient", DEFAULT_REMINDER_GROUP
+        ).strip()
+        if group_recipient:
+            channels.append(("群聊", group_recipient))
+    if get_setting("private_reminder_enabled", "0") == "1":
+        channels.append(("私聊", task["assignee"]))
+    return channels
+
+
+def save_reminder_settings(
+    group_enabled: bool,
+    private_enabled: bool,
+    group_recipient: str,
+    normal_slots_value: str,
+    urgent_slots_value: str,
+) -> None:
+    normal_slots = parse_reminder_slots(normal_slots_value)
+    urgent_slots = parse_reminder_slots(urgent_slots_value)
+    if group_enabled and not group_recipient.strip():
+        raise ValueError("开启群提醒时必须填写群名称。")
+    values = {
+        "group_reminder_enabled": "1" if group_enabled else "0",
+        "private_reminder_enabled": "1" if private_enabled else "0",
+        "reminder_group_recipient": group_recipient.strip() or DEFAULT_REMINDER_GROUP,
+        "normal_reminder_slots": ",".join(normal_slots),
+        "urgent_reminder_slots": ",".join(urgent_slots),
+    }
+    with db() as connection:
+        connection.executemany(
+            """
+            INSERT INTO settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            values.items(),
+        )
+
+
 def get_submissions(task_id: int) -> list[sqlite3.Row]:
     with db() as connection:
         return connection.execute(
@@ -359,7 +448,10 @@ def is_urgent_or_overdue(task: sqlite3.Row, today: date | None = None) -> bool:
 
 
 def get_pending_reminder_tasks(
-    reminder_date: str, reminder_slot: str
+    reminder_date: str,
+    reminder_slot: str,
+    normal_slots: tuple[str, ...],
+    urgent_slots: tuple[str, ...],
 ) -> list[sqlite3.Row]:
     with db() as connection:
         tasks = connection.execute(
@@ -379,7 +471,7 @@ def get_pending_reminder_tasks(
             """,
             (reminder_date, reminder_slot),
         ).fetchall()
-    if reminder_slot in URGENT_REMINDER_SLOTS and reminder_slot not in NORMAL_REMINDER_SLOTS:
+    if reminder_slot in urgent_slots and reminder_slot not in normal_slots:
         return [task for task in tasks if is_urgent_or_overdue(task)]
     return tasks
 
@@ -571,6 +663,20 @@ def reminder_message(task: sqlite3.Row, link: str, urgent: bool) -> str:
     )
 
 
+def send_task_notification(
+    task: sqlite3.Row, message: str
+) -> tuple[bool, str]:
+    channels = get_reminder_channels(task)
+    if not channels:
+        return False, "群提醒和私聊提醒均未开启。"
+    results: list[tuple[bool, str]] = []
+    for channel_name, recipient in channels:
+        ok, detail = send_wechat_message(recipient, message)
+        results.append((ok, f"{channel_name}（{recipient}）：{detail}"))
+        time.sleep(0.4)
+    return all(ok for ok, _ in results), "；".join(detail for _, detail in results)
+
+
 def admin_submission_message(
     task: sqlite3.Row, submission: sqlite3.Row
 ) -> str:
@@ -606,13 +712,16 @@ def send_admin_submission(
 
 def run_reminder_slot(reminder_slot: str) -> None:
     reminder_date = date.today().isoformat()
-    tasks = get_pending_reminder_tasks(reminder_date, reminder_slot)
-    urgent_slot = reminder_slot in URGENT_REMINDER_SLOTS and reminder_slot not in NORMAL_REMINDER_SLOTS
+    normal_slots, urgent_slots = get_reminder_slots()
+    tasks = get_pending_reminder_tasks(
+        reminder_date, reminder_slot, normal_slots, urgent_slots
+    )
+    urgent_slot = reminder_slot in urgent_slots and reminder_slot not in normal_slots
     print(f"[REMINDER] {reminder_date} {reminder_slot} 待提醒任务：{len(tasks)}")
     for task in tasks:
         link = submission_url(task, PUBLIC_BASE_URL or f"http://{HOST}:{PORT}")
-        ok, detail = send_wechat_message(
-            task["assignee"],
+        ok, detail = send_task_notification(
+            task,
             reminder_message(task, link, urgent_slot or is_urgent_or_overdue(task)),
         )
         record_reminder_attempt(task["id"], reminder_date, reminder_slot, ok, detail)
@@ -624,12 +733,13 @@ def run_reminder_slot(reminder_slot: str) -> None:
 
 
 def reminder_loop() -> None:
-    reminder_slots = tuple(dict.fromkeys(NORMAL_REMINDER_SLOTS + URGENT_REMINDER_SLOTS))
     last_run_keys: set[str] = set()
     while True:
         now = datetime.now()
         today = now.date().isoformat()
         current_time = now.strftime("%H:%M")
+        normal_slots, urgent_slots = get_reminder_slots()
+        reminder_slots = tuple(dict.fromkeys(normal_slots + urgent_slots))
         for slot in reminder_slots:
             key = f"{today} {slot}"
             if current_time == slot and key not in last_run_keys:
@@ -809,6 +919,9 @@ def premium_styles() -> str:
     .compact-card { padding:21px; }
     .compact-card .section-head { display:block; margin-bottom:14px; }
     .compact-card .section-note { margin-top:5px; line-height:1.6; }
+    .toggle-row { display:flex; align-items:center; gap:10px; padding:9px 0;
+      font-weight:700; }
+    .toggle-row input { width:18px; height:18px; margin:0; }
     .create-card { min-height:100%; }
     .create-card .grid { grid-template-columns:1fr 1fr; }
     .create-card .grid label:first-child { grid-column:1 / -1; }
@@ -854,6 +967,15 @@ def page(
         if (task["submission_count"] > 0) == (view == "done")
     ]
     admin_recipient = get_admin_recipient()
+    normal_slots, urgent_slots = get_reminder_slots()
+    group_enabled = get_setting("group_reminder_enabled", "1") == "1"
+    private_enabled = get_setting("private_reminder_enabled", "0") == "1"
+    reminder_group = get_setting(
+        "reminder_group_recipient", DEFAULT_REMINDER_GROUP
+    ).strip() or DEFAULT_REMINDER_GROUP
+    schedule_summary = (
+        f"常规 {', '.join(normal_slots)}；临期/逾期 {', '.join(urgent_slots)}"
+    )
     cards = []
     for task in visible_tasks:
         notification_status = (
@@ -954,7 +1076,7 @@ def page(
         <div class="brand-subtitle">微信通知、资料提交与进度管理</div>
       </div>
     </div>
-    <div class="schedule-chip">08:30 常规提醒，14:30 临期/逾期加提醒</div>
+    <div class="schedule-chip">{html.escape(schedule_summary)}</div>
   </header>
   <section class="stats">
     <div class="stat">
@@ -1004,6 +1126,40 @@ def page(
       </form>
     </div>
     <div class="side-stack">
+      <section class="card compact-card">
+        <div class="section-head">
+          <h2>提醒设置</h2>
+          <div class="section-note">控制群聊、私聊渠道和每日提醒时间。</div>
+        </div>
+        <form method="post" action="/settings/reminders" class="import-grid">
+          <label class="toggle-row">
+            <input type="checkbox" name="group_enabled" value="1"
+              {'checked' if group_enabled else ''}>
+            开启群消息提醒
+          </label>
+          <label>提醒群名称
+            <input name="group_recipient" maxlength="100"
+              value="{html.escape(reminder_group, quote=True)}">
+          </label>
+          <label class="toggle-row">
+            <input type="checkbox" name="private_enabled" value="1"
+              {'checked' if private_enabled else ''}>
+            开启责任人私聊提醒
+          </label>
+          <label>常规任务提醒时间
+            <input name="normal_slots" required
+              value="{html.escape(','.join(normal_slots), quote=True)}"
+              placeholder="08:30">
+          </label>
+          <label>临期/逾期提醒时间
+            <input name="urgent_slots" required
+              value="{html.escape(','.join(urgent_slots), quote=True)}"
+              placeholder="08:30,14:30">
+          </label>
+          <button type="submit">保存提醒设置</button>
+        </form>
+        <p class="import-tip">多个时间用英文逗号分隔，例如 08:30,14:30。</p>
+      </section>
       <section class="card compact-card">
         <div class="section-head">
           <h2>管理员通知</h2>
@@ -1402,11 +1558,12 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
         if parsed.path == "/api/health":
+            normal_slots, urgent_slots = get_reminder_slots()
             data = json.dumps(
                 {
                     "ok": True,
-                    "normal_reminder_slots": NORMAL_REMINDER_SLOTS,
-                    "urgent_reminder_slots": URGENT_REMINDER_SLOTS,
+                    "normal_reminder_slots": normal_slots,
+                    "urgent_reminder_slots": urgent_slots,
                 },
                 ensure_ascii=False,
             ).encode("utf-8")
@@ -1447,6 +1604,22 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        if parsed.path == "/settings/reminders":
+            form = self.read_form()
+            try:
+                save_reminder_settings(
+                    group_enabled=form.get("group_enabled") == "1",
+                    private_enabled=form.get("private_enabled") == "1",
+                    group_recipient=form.get("group_recipient", ""),
+                    normal_slots_value=form.get("normal_slots", ""),
+                    urgent_slots_value=form.get("urgent_slots", ""),
+                )
+            except ValueError as exc:
+                self.redirect(f"提醒设置保存失败：{exc}", True)
+                return
+            self.redirect("提醒渠道和时间设置已保存。")
+            return
+
         if parsed.path == "/settings/admin":
             form = self.read_form()
             admin_recipient = form.get("admin_recipient", "").strip()
@@ -1463,8 +1636,8 @@ class Handler(BaseHTTPRequestHandler):
             failed: list[str] = []
             for task in tasks:
                 link = submission_url(task, self.request_base_url())
-                ok, detail = send_wechat_message(
-                    task["assignee"],
+                ok, detail = send_task_notification(
+                    task,
                     reminder_message(task, link, is_urgent_or_overdue(task)),
                 )
                 if ok:
@@ -1518,7 +1691,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             link = submission_url(task, self.request_base_url())
             message = notification_message(task, link)
-            ok, detail = send_wechat_message(task["assignee"], message)
+            ok, detail = send_task_notification(task, message)
             if ok:
                 mark_notified(task_id)
             self.redirect(detail, not ok)
@@ -1549,9 +1722,10 @@ def main() -> None:
     )
     reminder_thread.start()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
+    normal_slots, urgent_slots = get_reminder_slots()
     print(f"微信任务跟踪后台已启动：http://{HOST}:{PORT}")
-    print(f"常规提醒：{', '.join(NORMAL_REMINDER_SLOTS)}")
-    print(f"临期/逾期提醒：{', '.join(URGENT_REMINDER_SLOTS)}")
+    print(f"常规提醒：{', '.join(normal_slots)}")
+    print(f"临期/逾期提醒：{', '.join(urgent_slots)}")
     print("按 Ctrl+C 停止。")
     try:
         server.serve_forever()
