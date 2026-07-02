@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$Recipient,
     [Parameter(Mandatory = $true)][string]$Message,
-    [string]$AttachmentPath = ""
+    [string]$AttachmentPath = "",
+    [string]$Mention = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -254,7 +255,19 @@ if (-not $messageFocused) {
 
 Start-Sleep -Milliseconds 200
 [System.Windows.Forms.SendKeys]::SendWait("^a")
-Paste-Text $Message
+if ($Mention) {
+    # Type @ first so WeChat opens the group member picker. The following
+    # keyword may match a substring of the member's group display name.
+    [System.Windows.Forms.SendKeys]::SendWait("@")
+    Start-Sleep -Milliseconds 300
+    Paste-Text $Mention
+    Start-Sleep -Milliseconds 900
+    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+    Start-Sleep -Milliseconds 300
+    Paste-Text (" " + $Message)
+} else {
+    Paste-Text $Message
+}
 Start-Sleep -Milliseconds 200
 [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
 

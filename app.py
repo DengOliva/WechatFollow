@@ -589,7 +589,10 @@ def parse_task_excel(file_data: bytes) -> tuple[list[tuple[str, str, str]], list
 
 
 def send_wechat_message(
-    recipient: str, message: str, attachment_path: Path | None = None
+    recipient: str,
+    message: str,
+    attachment_path: Path | None = None,
+    mention: str = "",
 ) -> tuple[bool, str]:
     command = [
         "powershell.exe",
@@ -606,6 +609,8 @@ def send_wechat_message(
     ]
     if attachment_path is not None:
         command.extend(["-AttachmentPath", str(attachment_path)])
+    if mention.strip():
+        command.extend(["-Mention", mention.strip()])
     with WECHAT_LOCK:
         try:
             result = subprocess.run(
@@ -671,7 +676,8 @@ def send_task_notification(
         return False, "群提醒和私聊提醒均未开启。"
     results: list[tuple[bool, str]] = []
     for channel_name, recipient in channels:
-        ok, detail = send_wechat_message(recipient, message)
+        mention = task["assignee"] if channel_name == "群聊" else ""
+        ok, detail = send_wechat_message(recipient, message, mention=mention)
         results.append((ok, f"{channel_name}（{recipient}）：{detail}"))
         time.sleep(0.4)
     return all(ok for ok, _ in results), "；".join(detail for _, detail in results)
