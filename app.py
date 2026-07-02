@@ -696,6 +696,17 @@ def parse_task_excel(file_data: bytes) -> tuple[list[tuple[str, str, str]], list
     return tasks, errors
 
 
+def decode_multipart_text(part: object) -> str:
+    payload = part.get_payload(decode=True) or b""
+    if isinstance(payload, str):
+        return payload.strip()
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset).strip()
+    except (LookupError, UnicodeDecodeError):
+        return payload.decode("utf-8", errors="replace").strip()
+
+
 def send_wechat_message(
     recipient: str,
     message: str,
@@ -1568,7 +1579,7 @@ class Handler(BaseHTTPRequestHandler):
             if filename:
                 parts[name] = (filename, part.get_payload(decode=True) or b"")
             else:
-                parts[name] = ("", part.get_content().strip())
+                parts[name] = ("", decode_multipart_text(part))
         return parts
 
     def read_submission_multipart(self) -> tuple[str, str, bytes]:
