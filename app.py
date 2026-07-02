@@ -12,12 +12,14 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from datetime import date, datetime
+import zipfile
+from datetime import date, datetime, timedelta
 from email.parser import BytesParser
 from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
+from xml.etree import ElementTree
 
 from openpyxl import load_workbook
 
@@ -542,14 +544,115 @@ def normalize_header(value: object) -> str:
     return "".join(format_excel_cell(value).split())
 
 
-def parse_task_excel(file_data: bytes) -> tuple[list[tuple[str, str, str]], list[str]]:
+def format_excel_deadline(value: object) -> str:
+    if isinstance(value, (int, float)) and 20000 <= float(value) <= 100000:
+        excel_date = datetime(1899, 12, 30) + timedelta(days=float(value))
+        excel_date = (excel_date + timedelta(microseconds=500000)).replace(
+            microsecond=0
+        )
+        if excel_date.time() == datetime.min.time():
+            return excel_date.strftime("%Y-%m-%d")
+        return excel_date.strftime("%Y-%m-%d %H:%M")
+    return format_excel_cell(value)
+
+
+def xlsx_cell_column(reference: str) -> int:
+    column = 0
+    for char in reference:
+        if not char.isalpha():
+            break
+        column = column * 26 + (ord(char.upper()) - ord("A") + 1)
+    return max(0, column - 1)
+
+
+def read_xlsx_rows_without_styles(file_data: bytes) -> list[tuple[object, ...]]:
+    spreadsheet_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    relationship_ns = (
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    )
+    package_rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    with zipfile.ZipFile(BytesIO(file_data)) as archive:
+        workbook_root = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+        first_sheet = workbook_root.find(f".//{{{spreadsheet_ns}}}sheet")
+        if first_sheet is None:
+            raise ValueError("Excel 中没有工作表。")
+        relationship_id = first_sheet.attrib.get(f"{{{relationship_ns}}}id", "")
+        relationships = ElementTree.fromstring(
+            archive.read("xl/_rels/workbook.xml.rels")
+        )
+        sheet_target = ""
+        for relationship in relationships.findall(f"{{{package_rel_ns}}}Relationship"):
+            if relationship.attrib.get("Id") == relationship_id:
+                sheet_target = relationship.attrib.get("Target", "")
+                break
+        if not sheet_target:
+            raise ValueError("无法定位 Excel 工作表。")
+        sheet_path = sheet_target.lstrip("/")
+        if not sheet_path.startswith("xl/"):
+            sheet_path = "xl/" + sheet_path
+
+        shared_strings: list[str] = []
+        if "xl/sharedStrings.xml" in archive.namelist():
+            shared_root = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
+            for item in shared_root.findall(f"{{{spreadsheet_ns}}}si"):
+                shared_strings.append(
+                    "".join(
+                        node.text or ""
+                        for node in item.iter(f"{{{spreadsheet_ns}}}t")
+                    )
+                )
+
+        sheet_root = ElementTree.fromstring(archive.read(sheet_path))
+        rows: list[tuple[object, ...]] = []
+        for row_node in sheet_root.findall(f".//{{{spreadsheet_ns}}}row"):
+            values: dict[int, object] = {}
+            for cell in row_node.findall(f"{{{spreadsheet_ns}}}c"):
+                column = xlsx_cell_column(cell.attrib.get("r", ""))
+                cell_type = cell.attrib.get("t", "")
+                value_node = cell.find(f"{{{spreadsheet_ns}}}v")
+                raw_value = value_node.text if value_node is not None else ""
+                if cell_type == "inlineStr":
+                    value: object = "".join(
+                        node.text or ""
+                        for node in cell.iter(f"{{{spreadsheet_ns}}}t")
+                    )
+                elif cell_type == "s":
+                    index = int(raw_value) if raw_value else -1
+                    value = shared_strings[index] if 0 <= index < len(shared_strings) else ""
+                elif cell_type == "b":
+                    value = "TRUE" if raw_value == "1" else "FALSE"
+                elif cell_type in {"str", "d"}:
+                    value = raw_value
+                elif raw_value:
+                    number = float(raw_value)
+                    value = int(number) if number.is_integer() else number
+                else:
+                    value = ""
+                values[column] = value
+            width = max(values, default=-1) + 1
+            rows.append(tuple(values.get(index) for index in range(width)))
+        return rows
+
+
+def read_task_excel_rows(file_data: bytes) -> list[tuple[object, ...]]:
     try:
         workbook = load_workbook(BytesIO(file_data), data_only=True, read_only=True)
-    except Exception as exc:
-        raise ValueError(f"无法读取 Excel 文件：{exc}") from exc
+        try:
+            return list(workbook.active.iter_rows(values_only=True))
+        finally:
+            workbook.close()
+    except Exception as primary_error:
+        try:
+            return read_xlsx_rows_without_styles(file_data)
+        except Exception as fallback_error:
+            raise ValueError(
+                f"无法读取 Excel 文件：{primary_error}；忽略样式后仍失败：{fallback_error}"
+            ) from fallback_error
 
-    sheet = workbook.active
-    header_row = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), None)
+
+def parse_task_excel(file_data: bytes) -> tuple[list[tuple[str, str, str]], list[str]]:
+    rows = read_task_excel_rows(file_data)
+    header_row = rows[0] if rows else None
     if not header_row:
         raise ValueError("Excel 第一行必须是表头。")
 
@@ -562,10 +665,15 @@ def parse_task_excel(file_data: bytes) -> tuple[list[tuple[str, str, str]], list
 
     tasks: list[tuple[str, str, str]] = []
     errors: list[str] = []
-    for row_number, row in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
-        content = format_excel_cell(row[headers[required_keys["任务内容及要求"]]])
-        assignee = format_excel_cell(row[headers[required_keys["责任人"]]])
-        deadline = format_excel_cell(row[headers[required_keys["完成期限"]]])
+    for row_number, row in enumerate(rows[1:], start=2):
+        def value_at(index: int) -> object:
+            return row[index] if index < len(row) else None
+
+        content = format_excel_cell(value_at(headers[required_keys["任务内容及要求"]]))
+        assignee = format_excel_cell(value_at(headers[required_keys["责任人"]]))
+        deadline = format_excel_deadline(
+            value_at(headers[required_keys["完成期限"]])
+        )
 
         if not any((content, assignee, deadline)):
             continue
